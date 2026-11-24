@@ -1,0 +1,6 @@
+data/
+sessions/
+__pycache__/
+*.pyc
+*.session
+render_env.txt
