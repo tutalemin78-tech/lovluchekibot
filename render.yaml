@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: check-hunter
+    runtime: python
+    plan: free          # free засыпает через 15 мин без запросов — см. ИНСТРУКЦИЯ-RENDER.txt (пинг или платный Starter)
+    buildCommand: pip install -r requirements-headless.txt
+    startCommand: python headless.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: SESSION_1
+        sync: false
+      - key: SESSION_2
+        sync: false
