@@ -32,6 +32,19 @@ from .storage import SESSIONS_DIR, Store
 
 BOT_USERNAMES = ("send", "CryptoBot", "xrocket", "tonRocketBot", "wallet")
 DIALOGS_REFRESH_SEC = 15   # как часто обновлять список чатов/каналов
+# Ошибки, после которых сессия мертва навсегда (повторное подключение бесполезно)
+FATAL_SESSION_ERRORS = {
+    "AuthKeyDuplicatedError", "AuthKeyUnregisteredError", "AuthKeyInvalidError", "SessionRevokedError",
+    "SessionExpiredError", "UserDeactivatedError", "UserDeactivatedBanError",
+}
+ERROR_HINTS = {
+    "AuthKeyDuplicatedError": "сессию использовали одновременно из двух мест — Telegram её закрыл. "
+                              "Создайте новую (make_session.py) и не запускайте две копии бота",
+    "AuthKeyUnregisteredError": "сессия закрыта (завершена в Telegram). Создайте новую через make_session.py",
+    "SessionRevokedError": "сессия завершена в Telegram. Создайте новую через make_session.py",
+    "UserDeactivatedError": "аккаунт удалён/заморожен Telegram",
+    "UserDeactivatedBanError": "аккаунт заблокирован Telegram",
+}
 
 
 def parse_proxy(value: str):
@@ -99,6 +112,7 @@ class AccountWorker:
         self._ok_streak = 0
         self.status_ts = time.time()
         self.fail_count = 0
+        self.last_error = ""                          # причина последнего сбоя (для /status)
 
     # ---- утилиты ----
     @property
@@ -120,8 +134,9 @@ class AccountWorker:
             self.client = self.engine.make_client(self.acc)
             await self.client.connect()
             if not await self.client.is_user_authorized():
+                self.last_error = "Сессия недействительна (аккаунт не авторизован). Создайте новую через make_session.py"
                 self.set_status("unauthorized")
-                self.log("error", "Аккаунт не авторизован — удалите и добавьте его заново.")
+                self.log("error", "Аккаунт не авторизован — создайте новую сессию (make_session.py) и обновите SESSION_n.")
                 await self.client.disconnect()
                 return
             self.me = await self.client.get_me()
@@ -138,8 +153,14 @@ class AccountWorker:
             self.engine.spawn(self._warmup())
             self.engine.spawn(self._safety_poll())
         except Exception as e:  # noqa: BLE001
-            self.set_status("error")
-            self.log("error", f"Ошибка подключения: {e!r}")
+            name = type(e).__name__
+            self.last_error = f"{name}: {str(e)[:150]}"
+            if name in FATAL_SESSION_ERRORS:
+                self.set_status("unauthorized")   # сессия мертва — повторы бесполезны
+                self.log("error", f"Сессия недействительна ({name}): {ERROR_HINTS.get(name, '')}")
+            else:
+                self.set_status("error")
+                self.log("error", f"Ошибка подключения: {e!r}")
 
     async def stop(self) -> None:
         try:
@@ -170,6 +191,9 @@ class AccountWorker:
                  "unauthorized": "🔴 сессия недействительна", "stopped": "⚪ остановлен"}
         lines = [f"<b>{i}. {e(d['name'])}</b>{e(uname)} — {names.get(self.status, self.status)}"]
         if self.status != "online" or not self.client:
+            if self.last_error:
+                name = self.last_error.split(":", 1)[0]
+                lines.append("   ❗ причина: " + e(ERROR_HINTS.get(name) or self.last_error))
             return lines, 1
         now = time.time()
         t0 = time.perf_counter()
@@ -211,7 +235,10 @@ class AccountWorker:
         interval = float(self.engine.settings.get("safety_poll_sec") or 0)
         if interval > 0:
             if self.poll_ts and now - self.poll_ts < max(30, interval * 10):
-                lines.append(f"   🛡 страховочная проверка: ок ({int(now - self.poll_ts)} с назад)")
+                every = interval * self._poll_slow
+                lines.append(f"   🛡 страховочная проверка: ок ({int(now - self.poll_ts)} с назад, раз в {every:g} с)")
+                if self._poll_slow > 1:
+                    lines.append("   ⚠ Telegram ограничивает частоту запросов — проверка временно замедлена (push работает как обычно)")
             elif self.poll_ts:
                 lines.append("   🛡 страховочная проверка: ⚠ давно не отрабатывала")
                 problems += 1
@@ -789,7 +816,7 @@ class Engine(QObject):
                 pass
             for w in list(self.workers.values()):
                 try:
-                    if w.status == "error" and time.time() - w.status_ts > 60:
+                    if w.status == "error" and time.time() - w.status_ts > 15:
                         w.log("warn", "Переподключаю аккаунт после ошибки…")
                         await self.start_account(w.acc)
                         continue
