@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import collections
+import html
 import re
 import threading
 import time
@@ -23,11 +25,13 @@ from .parser import (
     extract_links,
     is_confirmed_success,
     parse_amount,
+    rejected_links,
 )
 from .notifier import Notifier
 from .storage import SESSIONS_DIR, Store
 
 BOT_USERNAMES = ("send", "CryptoBot", "xrocket", "tonRocketBot", "wallet")
+DIALOGS_REFRESH_SEC = 15   # как часто обновлять список чатов/каналов
 
 
 def parse_proxy(value: str):
@@ -49,6 +53,27 @@ def parse_proxy(value: str):
     }
 
 
+class _Seen(set):
+    """set с ограничением размера: самые старые записи вытесняются — память не растёт месяцами."""
+
+    def __init__(self, limit: int = 20000) -> None:
+        super().__init__()
+        self._order: collections.deque = collections.deque()
+        self._limit = limit
+
+    def add(self, item) -> None:  # noqa: D401
+        if item in self:
+            return
+        super().add(item)
+        self._order.append(item)
+        if len(self._order) > self._limit:
+            super().discard(self._order.popleft())
+
+    def clear(self) -> None:
+        super().clear()
+        self._order.clear()
+
+
 class AccountWorker:
     """Один подключённый аккаунт: слушает чаты и мгновенно активирует чеки."""
 
@@ -57,13 +82,23 @@ class AccountWorker:
         self.acc = acc
         self.client: TelegramClient | None = None
         self.status = "stopped"
-        self.seen: set[tuple[str, str]] = set()
+        self.seen: set = _Seen()
         self.bots: dict[str, object] = {}
         self.bot_ids: set[int] = set()
         self.titles: dict[int, str] = {}
         self.me = None
         self._rx_seq = 0                      # счётчик сообщений от ботов (для мгновенного пробуждения)
         self._waiters: list[asyncio.Future] = []
+        self.dialogs: dict[int, tuple[str, str]] = {}   # id чата -> (название, тип)
+        self.dialogs_ts = 0.0                           # когда список чатов обновляли в последний раз
+        self.last_event = 0.0                           # когда пришло последнее сообщение
+        self.poll_ts = 0.0                              # когда отработала страховочная проверка
+        self._pushed: dict[int, int] = {}               # chat_id -> последний id, доставленный push-обновлением
+        self._top_seen: dict[int, int] = {}             # chat_id -> последний известный id сообщения
+        self._poll_slow = 1.0                           # множитель интервала при FloodWait
+        self._ok_streak = 0
+        self.status_ts = time.time()
+        self.fail_count = 0
 
     # ---- утилиты ----
     @property
@@ -75,6 +110,7 @@ class AccountWorker:
 
     def set_status(self, status: str) -> None:
         self.status = status
+        self.status_ts = time.time()
         self.engine.account_status.emit(self.acc["id"], status)
 
     # ---- жизненный цикл ----
@@ -124,6 +160,82 @@ class AccountWorker:
             except Exception:  # noqa: BLE001
                 pass
 
+    async def status_lines(self, i: int) -> tuple[list[str], int]:
+        """Подробный статус аккаунта для /status. Возвращает (строки, число проблем)."""
+        e = html.escape
+        d = self.describe()
+        problems = 0
+        uname = f" (@{d['username']})" if d["username"] else ""
+        names = {"online": "🟢 онлайн", "connecting": "🟡 подключается", "error": "🔴 ошибка подключения",
+                 "unauthorized": "🔴 сессия недействительна", "stopped": "⚪ остановлен"}
+        lines = [f"<b>{i}. {e(d['name'])}</b>{e(uname)} — {names.get(self.status, self.status)}"]
+        if self.status != "online" or not self.client:
+            return lines, 1
+        now = time.time()
+        t0 = time.perf_counter()
+        try:  # живая проверка: реально спрашиваем Telegram прямо сейчас
+            await asyncio.wait_for(self.client(functions.updates.GetStateRequest()), 8)
+            lines.append(f"   📡 связь с Telegram: ок ({int((time.perf_counter() - t0) * 1000)} мс)")
+        except Exception:  # noqa: BLE001
+            lines.append("   📡 связь с Telegram: ❌ нет ответа")
+            problems += 1
+        counts = {"channel": 0, "group": 0, "private": 0}
+        for _t, kind in self.dialogs.values():
+            if kind in counts:
+                counts[kind] += 1
+        if self.engine.settings.get("monitor_all") or self.acc.get("monitor_all"):
+            total = sum(counts.values())
+            if not self.dialogs_ts:
+                lines.append("   👁 список чатов ещё загружается…")
+                problems += 1
+            else:
+                lines.append(f"   👁 слежу за ВСЕМИ чатами: <b>{total}</b> (каналов {counts['channel']}, "
+                             f"групп {counts['group']}, личных {counts['private']})")
+        else:
+            chats = self.acc.get("chats") or {}
+            missing = []
+            for cid, title in chats.items():
+                try:
+                    if int(cid) not in self.dialogs:
+                        missing.append(str(title))
+                except ValueError:
+                    missing.append(str(title))
+            lines.append(f"   👁 слежу за выбранными: <b>{len(chats) - len(missing)}/{len(chats)}</b>")
+            if missing and self.dialogs_ts:
+                lines.append("   ⚠ нет в аккаунте: " + e(", ".join(missing[:5])))
+                problems += 1
+        if self.dialogs_ts:
+            lines.append(f"   🔄 список чатов обновлён {int(now - self.dialogs_ts)} с назад "
+                         f"(новые чаты и каналы подхватываются каждые 15 с)")
+        lines.append("   💬 последнее сообщение получено " + (f"{int(now - self.last_event)} с назад" if self.last_event else "— пока не было"))
+        interval = float(self.engine.settings.get("safety_poll_sec") or 0)
+        if interval > 0:
+            if self.poll_ts and now - self.poll_ts < max(30, interval * 10):
+                lines.append(f"   🛡 страховочная проверка: ок ({int(now - self.poll_ts)} с назад)")
+            elif self.poll_ts:
+                lines.append("   🛡 страховочная проверка: ⚠ давно не отрабатывала")
+                problems += 1
+        # диалоги с ботами: если аккаунт ни разу не запускал бота, активация может не пройти
+        shown: set[int] = set()
+        bots = []
+        for name in BOT_USERNAMES:
+            ent = self.bots.get(name.lower())
+            if ent is None or ent.id in shown:
+                continue
+            shown.add(ent.id)
+            try:
+                msgs = await asyncio.wait_for(self.client.get_messages(ent, limit=1), 8)
+                bots.append(f"@{getattr(ent, 'username', None) or name} " + ("✓" if msgs else "⚠ не запущен"))
+                if not msgs:
+                    problems += 1
+            except Exception:  # noqa: BLE001
+                bots.append(f"@{name} ?")
+        if bots:
+            lines.append("   🤖 боты: " + e(", ".join(bots)))
+        if any("не запущен" in b for b in bots):
+            lines.append("   ➡ откройте этих ботов с этого аккаунта и нажмите Start (один раз)")
+        return lines, problems
+
     def describe(self) -> dict:
         me = self.me
         name = " ".join(x for x in (getattr(me, "first_name", ""), getattr(me, "last_name", "")) if x)
@@ -137,40 +249,70 @@ class AccountWorker:
             "chats": "все чаты" if all_chats else f"{n} выбр.",
         }
 
+    async def _check_top(self, cid: int, top: int) -> None:
+        """Сравнивает последнее сообщение чата с известным. Если появилось новое, которое push
+        не доставил, — достаёт его и обрабатывает. Первый раз только запоминает состояние."""
+        prev = self._top_seen.get(cid)
+        if prev is None:
+            self._top_seen[cid] = top
+            return
+        if top <= prev:
+            return
+        pushed = self._pushed.get(cid, 0)
+        if top > pushed:
+            ids = list(range(max(prev + 1, pushed + 1, top - 4), top + 1))
+            msgs = await self.client.get_messages(cid, ids=ids)   # при ошибке состояние не двигаем — повтор на след. цикле
+            self._pushed[cid] = top
+            for m in msgs:
+                if m:
+                    await self.handle(m, cid)
+        self._top_seen[cid] = top
+
     async def _safety_poll(self) -> None:
-        """Страховка: одним лёгким запросом раз в N сек. смотрит последние посты выбранных чатов.
-        Если Telegram вдруг задержал push-обновление, чек всё равно будет пойман. Дубли отсекает seen."""
-        last_top: dict[int, int] = {}
+        """Страховка: раз в N сек. (по умолчанию 1) одним лёгким запросом перечитывает последние
+        сообщения чатов. Если Telegram задержал/потерял push-обновление — сообщение всё равно будет
+        обработано. При monitor_all смотрит 100 самых свежих диалогов аккаунта (остальные — раз в
+        15 с через обновление списка чатов), иначе — выбранные чаты. Если push сработал, лишних
+        запросов нет. При FloodWait сама притормаживает и потом ускоряется обратно."""
         while self.client is not None and self.engine.running:
             interval = float(self.engine.settings.get("safety_poll_sec") or 0)
-            await asyncio.sleep(interval if interval > 0 else 2)
+            await asyncio.sleep(interval * self._poll_slow if interval > 0 else 2)
             if interval <= 0 or self.status != "online" or not self.client:
                 continue
             try:
-                peers = []
-                for cid in list((self.acc.get("chats") or {}))[:100]:
+                if self.engine.settings.get("monitor_all") or self.acc.get("monitor_all"):
+                    res = await self.client(functions.messages.GetDialogsRequest(
+                        offset_date=None, offset_id=0, offset_peer=types.InputPeerEmpty(), limit=100, hash=0))
+                else:
+                    peers = []
+                    for cid in list((self.acc.get("chats") or {}))[:100]:
+                        try:
+                            peers.append(types.InputDialogPeer(await self.client.get_input_entity(int(cid))))
+                        except Exception:  # noqa: BLE001
+                            pass
+                    if not peers:
+                        self.poll_ts = time.time()
+                        continue
+                    res = await self.client(functions.messages.GetPeerDialogsRequest(peers=peers))
+                for d in res.dialogs:
                     try:
-                        peers.append(types.InputDialogPeer(await self.client.get_input_entity(int(cid))))
+                        top = getattr(d, "top_message", None)
+                        if top:
+                            await self._check_top(utils.get_peer_id(d.peer), top)
+                    except (errors.FloodWaitError, asyncio.CancelledError):
+                        raise
                     except Exception:  # noqa: BLE001
                         pass
-                if not peers:
-                    continue
-                res = await self.client(functions.messages.GetPeerDialogsRequest(peers=peers))
-                for d in res.dialogs:
-                    top = getattr(d, "top_message", None)
-                    if not top:
-                        continue
-                    cid = utils.get_peer_id(d.peer)
-                    prev = last_top.get(cid)
-                    last_top[cid] = top
-                    if prev is None or top <= prev:   # первый проход только запоминает состояние
-                        continue
-                    ids = list(range(max(prev + 1, top - 4), top + 1))
-                    for m in await self.client.get_messages(cid, ids=ids):
-                        if m:
-                            await self.handle(m, cid)
+                self.poll_ts = time.time()
+                self._ok_streak += 1
+                if self._poll_slow > 1 and self._ok_streak >= 60:
+                    self._poll_slow = max(1.0, self._poll_slow / 2)
+                    self._ok_streak = 0
             except errors.FloodWaitError as e:
-                await asyncio.sleep(e.seconds + 1)
+                self._poll_slow = min(self._poll_slow * 2, 8.0)
+                self._ok_streak = 0
+                self.log("warn", f"Telegram просит притормозить ({e.seconds} с): страховочная проверка временно реже")
+                await asyncio.sleep(min(e.seconds, 60) + 1)
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001
@@ -197,21 +339,65 @@ class AccountWorker:
                 self._waiters.remove(fut)
 
     async def _warmup(self) -> None:
-        """Подгружаем диалоги, чтобы Telegram присылал обновления по всем каналам/чатам."""
+        """Загружает диалоги сразу и затем каждую минуту: новые чаты и каналы подхватываются автоматически,
+        а Telegram продолжает присылать по ним обновления."""
+        first = True
+        while self.client is not None and self.engine.running:
+            try:
+                found: dict[int, tuple[str, str]] = {}
+                async for d in self.client.iter_dialogs():
+                    try:   # заодно перечитываем последнее сообщение КАЖДОГО чата (страховка для чатов вне топ-100)
+                        top = getattr(getattr(d, "message", None), "id", None)
+                        if top and self.status == "online" and self.engine.watching(self.acc, d.id):
+                            await self._check_top(d.id, top)
+                    except (errors.FloodWaitError, asyncio.CancelledError):
+                        raise
+                    except Exception:  # noqa: BLE001
+                        pass
+                    if d.is_channel and not d.is_group:
+                        kind = "channel"
+                    elif d.is_group:
+                        kind = "group"
+                    elif getattr(d.entity, "bot", False):
+                        kind = "bot"
+                    else:
+                        kind = "private"
+                    found[d.id] = (d.name or str(d.id), kind)
+                if not first:
+                    added = [v[0] for k, v in found.items() if k not in self.dialogs and v[1] != "bot"]
+                    if added:
+                        more = f" и ещё {len(added) - 5}" if len(added) > 5 else ""
+                        self.log("ok", f"➕ Новые чаты/каналы подхвачены ({len(added)}): {', '.join(added[:5])}{more}")
+                self.dialogs = found
+                for k, v in found.items():
+                    self.titles[k] = v[0]
+                self.dialogs_ts = time.time()
+                first = False
+            except errors.FloodWaitError as e:
+                await asyncio.sleep(min(e.seconds, 120))
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                pass
+            await asyncio.sleep(DIALOGS_REFRESH_SEC)
+
+    # ---- обработчики ----
+    def _stamp(self, event) -> None:
+        self.last_event = time.time()
         try:
-            assert self.client
-            async for d in self.client.iter_dialogs():
-                self.titles[d.id] = d.name or str(d.id)
+            if event.message.id > self._pushed.get(event.chat_id, 0):
+                self._pushed[event.chat_id] = event.message.id
         except Exception:  # noqa: BLE001
             pass
 
-    # ---- обработчики ----
     async def on_new(self, event) -> None:
+        self._stamp(event)
         if event.chat_id in self.bot_ids:
             self._poke()
         await self.handle(event.message, event.chat_id)
 
     async def on_edit(self, event) -> None:
+        self._stamp(event)
         if event.chat_id in self.bot_ids:
             self._poke()
         await self.handle(event.message, event.chat_id)
@@ -228,6 +414,9 @@ class AccountWorker:
                 for link in links:
                     self.engine.spawn(self.claim(link, chat_id))
                 return
+            rej = rejected_links(msg)
+            if rej:
+                self.log("warn", f"Ссылка на бота есть, но не похожа на чек — пропущена: {rej[0]}")
             # Запасной вариант: чек в виде callback-кнопки «Получить»
             sender = getattr(msg, "sender_id", None)
             via = getattr(msg, "via_bot_id", None)
@@ -252,7 +441,9 @@ class AccountWorker:
         seen.add(key)
         t0 = time.perf_counter()
         chat_title = self.titles.get(chat_id) or str(chat_id)
-        self.log("info", f"🎯 Чек {link.service} {link.amount_text or ''} найден в «{chat_title}» — активирую…")
+        # лог — после отправки запроса, чтобы ничто не задерживало клик
+        asyncio.get_running_loop().call_soon(
+            self.log, "info", f"🎯 Чек {link.service} {link.amount_text or ''} найден в «{chat_title}» — активирую…")
 
         min_amount = float(st.get("min_amount") or 0)
         if min_amount and link.amount and link.amount[0] < min_amount:
@@ -276,10 +467,12 @@ class AccountWorker:
                 break
             except Exception as e:  # noqa: BLE001
                 status, detail = "error", repr(e)
+                if type(e).__name__ == "UserIsBlockedError":   # аккаунт когда-то заблокировал бота — снимаем блок
+                    await self._unblock_bots()
             if status in ("success", "fail"):
                 break
             self.log("warn", f"Попытка {attempt}: {status} {detail[:80]}")
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.3 if status == "timeout" else 1.0)
 
         if status not in ("success", "fail"):
             seen.discard(key)  # позволим повторить, если чек встретится снова
@@ -287,6 +480,7 @@ class AccountWorker:
 
     def _record(self, link: CheckLink, chat_title: str, status: str, detail: str, t0: float) -> None:
         ms = int((time.perf_counter() - t0) * 1000)
+        self.engine.stats[status] = self.engine.stats.get(status, 0) + 1
         amount = parse_amount(detail) if status == "success" else None
         amount = amount or link.amount
         rec = {
@@ -304,7 +498,7 @@ class AccountWorker:
         }
         if status == "success":
             if is_confirmed_success(detail):
-                self.engine.notifier.notify_success(rec)
+                self.engine.notifier.notify_success(rec, self.describe())
             self.log("ok", f"✅ Чек активирован! {rec['amount']} за {ms} мс")
         elif status == "fail":
             self.log("warn", f"⚠ Не удалось: {rec['detail'][:140]}")
@@ -340,6 +534,8 @@ class AccountWorker:
                 verdict = classify(text)
                 if verdict == "success":
                     return "success", text
+                if verdict == "retry":
+                    return "error", "Бот просит повторить: " + text
                 if verdict == "fail":
                     return "fail", text
                 if verdict == "captcha":
@@ -355,6 +551,13 @@ class AccountWorker:
                     await self._press(m, CLAIM_BTN_WORDS)
             await self._wait_reply(0.25, seq)
         return "timeout", last
+
+    async def _unblock_bots(self) -> None:
+        for ent in list(self.bots.values()):
+            try:
+                await self.client(functions.contacts.UnblockRequest(id=ent))
+            except Exception:  # noqa: BLE001
+                pass
 
     async def _press(self, m, words) -> bool:
         for i, row in enumerate(m.buttons or []):
@@ -410,13 +613,17 @@ class Engine(QObject):
         self.running = False
         self.workers: dict[str, AccountWorker] = {}
         self.logins: dict[str, dict] = {}
-        self.global_seen: set[tuple[str, str]] = set()
+        self.global_seen: set = _Seen()
         self.notifier = Notifier(self)
         self._startup_reported = False
+        self.stats: dict[str, int] = {}
+        self.started_at = time.time()
         self._tasks: set[asyncio.Task] = set()
         self._watchdog: asyncio.Task | None = None
         self._call.connect(self._invoke)
         self.loop = asyncio.new_event_loop()
+        self.loop.set_exception_handler(
+            lambda _l, ctx: print("loop error:", ctx.get("message"), repr(ctx.get("exception")), flush=True))
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
         self.thread.start()
 
@@ -492,8 +699,46 @@ class Engine(QObject):
             return_exceptions=True,
         )
         await self._report_accounts()
+        self.notifier.start_commands()
         if not self._watchdog or self._watchdog.done():
             self._watchdog = self.loop.create_task(self._watch())
+
+    async def status_parts(self) -> list[str]:
+        """Текст команды /status (несколько сообщений, если аккаунтов много)."""
+        workers = list(self.workers.values())
+        results = await asyncio.gather(*(w.status_lines(i) for i, w in enumerate(workers, 1)), return_exceptions=True)
+        blocks, problems = [], 0
+        for r in results:
+            if isinstance(r, Exception):
+                problems += 1
+                continue
+            blocks.append("\n".join(r[0]))
+            problems += r[1]
+        online = sum(1 for w in workers if w.status == "online")
+        if not workers:
+            problems += 1
+        ok = problems == 0 and online == len(workers)
+        up = int(time.time() - self.started_at)
+        done = self.stats.get("success", 0)
+        failed = sum(v for k, v in self.stats.items() if k not in ("success", "skipped"))
+        interval = float(self.settings.get("safety_poll_sec") or 0)
+        head = [
+            "✅ <b>ВСЁ РАБОТАЕТ — все аккаунты активны, чаты и каналы под контролем</b>" if ok
+            else "⚠️ <b>ЕСТЬ ПРОБЛЕМЫ — смотрите отметки ⚠/❌ ниже</b>",
+            f"🟢 Активных аккаунтов: <b>{online}/{len(workers)}</b>",
+            f"⏱ Работаю: {up // 3600} ч {up % 3600 // 60} мин",
+            f"🎯 Чеков активировано: <b>{done}</b> • неудачных попыток: {failed}",
+            "⚡ Ловлю сообщения мгновенно (push)" + (f" + страховочная проверка каждые {interval:g} с" if interval > 0 else ""),
+        ]
+        parts, cur = [], "\n".join(head)
+        for b in blocks:
+            if len(cur) + len(b) + 2 > 3500:
+                parts.append(cur)
+                cur = b
+            else:
+                cur += "\n\n" + b
+        parts.append(cur)
+        return parts
 
     async def _report_accounts(self) -> None:
         """Показывает все активные (подключённые) аккаунты; в Telegram — один раз за запуск программы."""
@@ -534,22 +779,41 @@ class Engine(QObject):
             await w.stop()
 
     async def _watch(self) -> None:
-        """Следит, чтобы соединения были живы, и «будит» поток обновлений."""
+        """Самолечение: держит соединения живыми, «будит» поток обновлений, переподключает зависшие
+        аккаунты и перезапускает приём команд /status, если он упал."""
         while True:
             await asyncio.sleep(15)
+            try:
+                self.notifier.start_commands()
+            except Exception:  # noqa: BLE001
+                pass
             for w in list(self.workers.values()):
-                if w.status not in ("online", "connecting") or not w.client:
-                    continue
                 try:
+                    if w.status == "error" and time.time() - w.status_ts > 60:
+                        w.log("warn", "Переподключаю аккаунт после ошибки…")
+                        await self.start_account(w.acc)
+                        continue
+                    if w.status not in ("online", "connecting") or not w.client:
+                        continue
                     if not w.client.is_connected():
                         w.set_status("connecting")
                         await w.client.connect()
-                    await w.client(functions.updates.GetStateRequest())
+                    await asyncio.wait_for(w.client(functions.updates.GetStateRequest()), 20)
+                    w.fail_count = 0
                     if w.status != "online":
                         w.set_status("online")
                         w.log("ok", "Соединение восстановлено.")
+                except asyncio.CancelledError:
+                    raise
                 except Exception as e:  # noqa: BLE001
-                    w.log("warn", f"Проблема связи, переподключаюсь: {e!r}")
+                    w.fail_count += 1
+                    w.log("warn", f"Проблема связи ({w.fail_count}), переподключаюсь: {e!r}")
+                    if w.fail_count >= 8:   # ~2 минуты без связи — полностью пересоздаём подключение
+                        w.log("warn", "Связь не восстанавливается — пересоздаю подключение.")
+                        try:
+                            await self.start_account(w.acc)
+                        except Exception:  # noqa: BLE001
+                            pass
 
     # ---- вход в аккаунт ----
     async def login_begin(self, acc: dict) -> bool:

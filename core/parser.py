@@ -11,6 +11,7 @@ BOT_SERVICES = {
     "xrocket": "xrocket",
     "tonrocketbot": "xrocket",
     "wallet": "wallet",
+    "xrocketbot": "xrocket",
 }
 
 # Префиксы start-параметров
@@ -26,7 +27,7 @@ REJECT_PREFIX = {
 }
 
 LINK_RE = re.compile(
-    r"(?:https?://)?(?:t|telegram)\.me/(?P<bot>[A-Za-z0-9_]+)\?start=(?P<param>[A-Za-z0-9_\-]+)",
+    r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me|telegram\.dog)/(?P<bot>[A-Za-z0-9_]+)/?\?start=(?P<param>[A-Za-z0-9_\-]+)",
     re.I,
 )
 TG_RE = re.compile(
@@ -69,6 +70,11 @@ SUBSCRIBE_WORDS = (
     "необходимо подписаться",
 )
 CAPTCHA_WORDS = ("captcha", "капч", "я не робот", "not a robot")
+# Временные отказы бота — нужно просто повторить, а не считать чек потерянным
+TRANSIENT_WORDS = (
+    "слишком много", "too many", "try again", "попробуйте позже", "попробуйте ещё", "попробуйте еще",
+    "подождите", "please wait", "temporarily", "временно", "flood", "rate limit", "повторите",
+)
 
 
 @dataclass
@@ -106,11 +112,12 @@ def _is_hinted(*texts: str) -> bool:
 
 
 def _accept(service: str, param: str, hinted: bool) -> bool:
-    if param.startswith(REJECT_PREFIX.get(service, ())):
+    low = param.lower()
+    if low.startswith(tuple(x.lower() for x in REJECT_PREFIX.get(service, ()))):
         return False
-    if param.startswith(ACCEPT_PREFIX.get(service, ())):
+    if low.startswith(tuple(x.lower() for x in ACCEPT_PREFIX.get(service, ()))):
         return True
-    return hinted  # неизвестный формат — берём только если рядом слова «получить/чек»
+    return hinted  # неизвестный формат — берём, если рядом слова «получить/чек» или сумма
 
 
 def _candidates(message) -> list[tuple[str, str]]:
@@ -127,6 +134,16 @@ def _candidates(message) -> list[tuple[str, str]]:
             if url:
                 out.append((url, getattr(b, "text", "") or ""))
 
+    try:  # сырая разметка: работает, даже когда message.buttons вернул None
+        markup = getattr(message, "reply_markup", None)
+        for row in getattr(markup, "rows", None) or []:
+            for b in getattr(row, "buttons", None) or []:
+                url = getattr(b, "url", None)
+                if url:
+                    out.append((url, getattr(b, "text", "") or ""))
+    except Exception:
+        pass
+
     text = message.raw_text or ""
     try:
         for ent, ent_text in message.get_entities_text():
@@ -139,6 +156,8 @@ def _candidates(message) -> list[tuple[str, str]]:
         pass
 
     for m in LINK_RE.finditer(text):
+        out.append((m.group(0), ""))
+    for m in TG_RE.finditer(text):
         out.append((m.group(0), ""))
     return out
 
@@ -156,7 +175,8 @@ def extract_links(message) -> list[CheckLink]:
         if not service:
             continue
         param = m.group("param")
-        if not _accept(service, param, _is_hinted(label, text)):
+        hinted = _is_hinted(label, text) or bool(parse_amount(label) or parse_amount(text))
+        if not _accept(service, param, hinted):
             continue
         key = (service, param)
         if key in seen:
@@ -165,6 +185,19 @@ def extract_links(message) -> list[CheckLink]:
         amount = parse_amount(label) or parse_amount(text)
         result.append(CheckLink(service, bot, param, label, amount))
     return result
+
+
+def rejected_links(message) -> list[str]:
+    """Ссылки на известных ботов (CryptoBot/xRocket/Wallet), которые НЕ приняты как чек — для диагностики."""
+    out: list[str] = []
+    try:
+        for url, _label in _candidates(message):
+            m = LINK_RE.search(url) or TG_RE.search(url)
+            if m and BOT_SERVICES.get(m.group("bot").lower()) and url not in out:
+                out.append(url)
+    except Exception:
+        pass
+    return out
 
 
 def _classify_base(text: str) -> str:
@@ -211,6 +244,9 @@ def classify(text: str) -> str:
     t = text or ""
     if _RECEIVED_RE.search(t) and parse_amount(t) and not _ALREADY_RE.search(t):
         return "success"
+    low = t.lower()
+    if any(w in low for w in TRANSIENT_WORDS):
+        return "retry"
     return _classify_base(t)
 
 

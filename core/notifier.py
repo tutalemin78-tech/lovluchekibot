@@ -12,6 +12,7 @@ import json
 import os
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 # ============ НАСТРОЙКИ УВЕДОМЛЕНИЙ (вписаны прямо в код) ============
@@ -29,6 +30,7 @@ class Notifier:
         self._queue: asyncio.Queue | None = None
         self._worker: asyncio.Task | None = None
         self._last_warn = 0.0
+        self._poller: asyncio.Task | None = None
 
     # ---- настройки ----
     def _cfg(self):
@@ -36,21 +38,28 @@ class Notifier:
         return enabled, BOT_TOKEN, OWNER_ID
 
     # ---- публичное API (можно вызывать из любого потока) ----
-    def notify(self, text: str) -> None:
+    def notify(self, text: str, force: bool = False) -> None:
         enabled, token, chat = self._cfg()
-        if not enabled:
+        if not enabled and not force:
             return
         self.engine.loop.call_soon_threadsafe(self._enqueue, (token, chat, text))
 
-    def notify_success(self, rec: dict) -> None:
+    def notify_success(self, rec: dict, acct: dict | None = None) -> None:
         e = html.escape
         service = SERVICE_NAMES.get(rec.get("service", ""), rec.get("service", "") or "—")
+        who = str(rec.get("account") or "—")
+        if acct:   # полное описание аккаунта, который забрал чек
+            who = acct.get("name") or who
+            if acct.get("username"):
+                who += f" (@{acct['username']})"
+            if acct.get("user_id"):
+                who += f" • ID {acct['user_id']}"
         lines = [
             "✅ <b>Чек успешно активирован!</b>",
             "",
             f"💰 Сумма: <b>{e(rec.get('amount') or '—')}</b>",
             f"🏦 Сервис: {e(service)}",
-            f"👤 Аккаунт: {e(str(rec.get('account') or '—'))}",
+            f"👤 Активировал аккаунт: <b>{e(who)}</b>",
             f"💬 Источник: {e(str(rec.get('chat') or '—'))}",
             f"⚡ Скорость: {int(rec.get('ms') or 0)} мс",
             f"🕒 {e(str(rec.get('time') or ''))}",
@@ -65,7 +74,76 @@ class Notifier:
             lines.append(f"{i}. <b>{e(a['name'])}</b>{e(uname)}")
             phone = f"📱 {e(a['phone'])} • " if a.get("phone") else ""
             lines.append(f"    {phone}ID {a.get('user_id') or '—'} • 💬 {e(a['chats'])}")
+        lines += ["", "ℹ️ Напишите мне /status — покажу состояние всех аккаунтов и чатов."]
         self.notify("\n".join(lines))
+
+    # ---- команды боту в личке (/status) ----
+    def start_commands(self) -> None:
+        """Запускает приём команд от владельца. Безопасно вызывать повторно."""
+        self.engine.loop.call_soon_threadsafe(self._start_poller)
+
+    def _start_poller(self) -> None:
+        if self._poller is None or self._poller.done():
+            self._poller = self.engine.loop.create_task(self._poll_commands())
+
+    async def _poll_commands(self) -> None:
+        while True:   # перезапускаем цикл при любой неожиданной ошибке
+            try:
+                await self._poll_commands_inner()
+            except asyncio.CancelledError:
+                raise
+            except Exception as ex:  # noqa: BLE001
+                self._warn(f"Сбой приёма команд, перезапускаю: {type(ex).__name__}")
+                await asyncio.sleep(5)
+
+    async def _poll_commands_inner(self) -> None:
+        loop = asyncio.get_running_loop()
+        offset, first, fails = 0, True, 0
+        while True:
+            _enabled, token, owner = self._cfg()
+            if first:   # пропускаем старые команды, накопившиеся пока бот был выключен
+                ok, updates, err = await loop.run_in_executor(None, self._get_updates, token, -1, 0)
+            else:
+                ok, updates, err = await loop.run_in_executor(None, self._get_updates, token, offset, 25)
+            if not ok:
+                fails += 1
+                if fails == 4:
+                    self._warn(f"Команды бота (/status) недоступны: {err}")
+                await asyncio.sleep(min(3 * fails, 30))
+                continue
+            fails = 0
+            if first:
+                first = False
+                offset = updates[-1]["update_id"] + 1 if updates else 0
+                continue
+            for u in updates:
+                offset = max(offset, u["update_id"] + 1)
+                msg = u.get("message") or {}
+                if (msg.get("chat") or {}).get("id") != owner:
+                    continue   # отвечаем только владельцу
+                text = (msg.get("text") or "").strip().lower()
+                try:
+                    if text.startswith("/status") or text == "статус":
+                        for part in await self.engine.status_parts():
+                            self.notify(part, force=True)
+                    elif text.startswith("/start") or text.startswith("/help"):
+                        self.notify("Команды:\n/status — состояние аккаунтов, чатов и каналов", force=True)
+                except Exception as ex:  # noqa: BLE001
+                    self.notify(f"Не удалось собрать статус: {type(ex).__name__}", force=True)
+
+    @staticmethod
+    def _get_updates(token: str, offset: int, timeout: int):
+        """-> (ok, список обновлений, ошибка)"""
+        q = urllib.parse.urlencode({"offset": offset, "timeout": timeout, "allowed_updates": '["message"]'})
+        url = API_URL.format(token=token).rsplit("/", 1)[0] + "/getUpdates?" + q
+        try:
+            with urllib.request.urlopen(url, timeout=timeout + 10) as r:
+                body = json.loads(r.read().decode("utf-8"))
+            return bool(body.get("ok")), body.get("result") or [], ""
+        except urllib.error.HTTPError as ex:
+            return False, [], f"HTTP {ex.code}" + (" (бот запущен ещё где-то?)" if ex.code == 409 else "")
+        except Exception as ex:  # noqa: BLE001
+            return False, [], type(ex).__name__
 
     # ---- внутреннее ----
     def _enqueue(self, item) -> None:  # выполняется в потоке движка
@@ -91,14 +169,14 @@ class Notifier:
         loop = asyncio.get_running_loop()
         delay = 1.0
         err = ""
-        for _ in range(4):
+        for _ in range(8):
             ok, err, retry_after, fatal = await loop.run_in_executor(None, self._post, token, chat, text)
             if ok:
                 return
             if fatal:
                 break
             await asyncio.sleep(retry_after + 0.5 if retry_after else delay)
-            delay *= 2
+            delay = min(delay * 2, 30)
         self._warn(f"Не удалось отправить уведомление в Telegram: {err}")
 
     @staticmethod
