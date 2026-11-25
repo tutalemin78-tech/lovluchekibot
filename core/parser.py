@@ -17,12 +17,12 @@ BOT_SERVICES = {
 # Префиксы start-параметров
 ACCEPT_PREFIX = {
     "cryptobot": ("CQ",),
-    "xrocket": ("mc_", "c_", "ch_", "mch_"),
+    "xrocket": ("mc_", "c_", "ch_", "mch_", "t_"),
     "wallet": ("C-", "c-"),
 }
 REJECT_PREFIX = {
     "cryptobot": ("IV", "iv", "ref", "BU"),
-    "xrocket": ("inv_", "t_", "ref", "r_"),
+    "xrocket": ("inv_", "ref", "r_"),
     "wallet": ("WV", "wv"),
 }
 
