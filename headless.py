@@ -51,6 +51,10 @@ def main() -> None:
     store = Store()
     store.settings["monitor_all"] = not chats
     store.settings["proxy"] = (os.environ.get("PROXY") or "").strip()
+    try:   # как часто (сек) принудительно перечитывать все чаты и сообщения; 0 = выкл.
+        store.settings["safety_poll_sec"] = float(os.environ.get("SAFETY_POLL_SEC") or 1)
+    except ValueError:
+        store.settings["safety_poll_sec"] = 1.0
     store.accounts = [
         {
             "id": f"s{i}", "title": os.environ.get(f"NAME_{i}") or f"Аккаунт {i}", "phone": "",
@@ -95,14 +99,28 @@ def main() -> None:
     except Exception as e:  # noqa: BLE001
         say(f"Запуск занял слишком долго или упал: {e!r}")
 
-    # Переподключаем аккаунты, которые не смогли подключиться (сбой сети и т.п.)
+    # Контроль работоспособности (самолечение аккаунтов делает сам движок).
+    # Если ни один аккаунт не в сети 10 минут подряд — аварийно выходим: Render перезапустит сервис с нуля.
+    down_since = None
+    last_beat = time.time()
     while True:
-        time.sleep(60)
-        for acc in store.accounts:
-            w = engine.workers.get(acc["id"])
-            if w and w.status == "error":
-                say(f"Переподключаю {w.label}…")
-                engine.run(engine.start_account(acc))
+        time.sleep(30)
+        if not engine.thread.is_alive():
+            say("Критическая ошибка: рабочий поток остановился — перезапуск.")
+            os._exit(1)
+        workers = list(engine.workers.values())
+        online = sum(1 for w in workers if w.status == "online")
+        if online == 0 and any(w.status != "unauthorized" for w in workers):
+            down_since = down_since or time.time()
+            if time.time() - down_since > 600:
+                say("Нет ни одного подключённого аккаунта 10 минут — перезапуск процесса.")
+                os._exit(1)
+        else:
+            down_since = None
+        if time.time() - last_beat >= 1800:   # раз в 30 минут — строка «жив» в логах Render
+            last_beat = time.time()
+            ok = engine.stats.get("success", 0)
+            say(f"Жив: аккаунтов в сети {online}/{len(workers)}, активировано чеков: {ok}")
 
 
 if __name__ == "__main__":
