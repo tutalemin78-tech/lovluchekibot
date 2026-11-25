@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import sys
 import threading
 import time
@@ -91,6 +92,27 @@ def main() -> None:
 
     server = HTTPServer(("0.0.0.0", int(os.environ.get("PORT") or 10000)), Health)
     threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    def on_term(signum, frame):   # Render останавливает старую копию — аккуратно отключаем аккаунты
+        say("Получен сигнал остановки — корректно отключаю аккаунты…")
+        try:
+            engine.run(engine.stop_all()).result(timeout=8)
+        except Exception:  # noqa: BLE001
+            pass
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
+
+    # Пауза перед подключением: при обновлении на Render старая копия ещё несколько секунд работает.
+    # Одну и ту же сессию нельзя использовать из двух мест одновременно — Telegram её убивает.
+    try:
+        delay = float(os.environ.get("START_DELAY_SEC") or 25)
+    except ValueError:
+        delay = 25
+    if delay > 0:
+        say(f"Жду {delay:g} с перед подключением аккаунтов (чтобы старая копия успела отключиться)…")
+        time.sleep(delay)
 
     say(f"Запуск: аккаунтов {len(store.accounts)}, режим: {'все чаты' if not chats else str(len(chats)) + ' чатов'}")
     fut = engine.run(engine.start_all())
